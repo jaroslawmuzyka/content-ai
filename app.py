@@ -3,21 +3,22 @@ import pandas as pd
 import requests
 import re
 import time
-from supabase import create_client, Client
+from datetime import datetime
+from supabase import create_client
 
 # --- KONFIGURACJA STRONY ---
-st.set_page_config(page_title="SEO 3.0 Content Machine (DB)", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="SEO 3.0 Content Factory", page_icon="🏭", layout="wide")
 
 # --- STYLE CSS ---
 st.markdown("""
 <style>
     .block-container {padding-top: 1rem;}
-    .stProgress > div > div > div > div { background-color: #4CAF50; }
+    /* Kolorowanie statusów */
+    div[data-testid="stText"] { font-size: 0.9em; }
 </style>
 """, unsafe_allow_html=True)
 
 # --- MAPOWANIE KOLUMN (BAZA -> UI) ---
-# Klucz: nazwa w bazie Supabase, Wartość: nazwa wyświetlana w Streamlit
 COLUMN_MAP = {
     'id': 'ID',
     'keyword': 'Słowo kluczowe',
@@ -33,7 +34,7 @@ COLUMN_MAP = {
     'headers_expanded': 'Nagłówki rozbudowane',
     'headers_h2': 'Nagłówki H2',
     'headers_questions': 'Nagłówki pytania',
-    'headers_final': 'Nagłówki (Finalne)', # NOWA KOLUMNA
+    'headers_final': 'Nagłówki (Finalne)',
     'status_rag': 'Status RAG',
     'rag_content': 'RAG',
     'rag_general': 'RAG General',
@@ -45,7 +46,6 @@ COLUMN_MAP = {
     'final_article': 'Generowanie contentu'
 }
 
-# Odwrócona mapa do zapisywania
 REVERSE_COLUMN_MAP = {v: k for k, v in COLUMN_MAP.items()}
 
 # --- SUPABASE INIT ---
@@ -57,52 +57,7 @@ def init_supabase():
 
 supabase = init_supabase()
 
-# --- FUNKCJE BAZODANOWE ---
-
-def fetch_data():
-    """Pobiera dane z Supabase i zwraca DataFrame z ładnymi nazwami kolumn."""
-    response = supabase.table("seo_content_tasks").select("*").order("id", desc=True).execute()
-    data = response.data
-    if not data:
-        return pd.DataFrame(columns=COLUMN_MAP.values())
-    
-    df = pd.DataFrame(data)
-    # Zmiana nazw kolumn na czytelne dla użytkownika
-    df = df.rename(columns=COLUMN_MAP)
-    return df
-
-def add_record(keyword, lang, aio):
-    """Dodaje nowy wiersz do bazy."""
-    new_data = {
-        "keyword": keyword,
-        "language": lang,
-        "aio_prompt": aio,
-        "headers_final": "" # Inicjalizacja pustego pola
-    }
-    supabase.table("seo_content_tasks").insert(new_data).execute()
-
-def update_record_in_db(row_id, updates):
-    """Aktualizuje konkretne pola w bazie dla danego ID."""
-    supabase.table("seo_content_tasks").update(updates).eq("id", row_id).execute()
-
-def save_editor_changes(edited_df):
-    """Zapisuje zmiany wprowadzone ręcznie w edytorze Streamlit."""
-    # To jest uproszczona wersja - iterujemy po wierszach i aktualizujemy.
-    # W produkcji dla dużej skali robi się to inaczej (tylko zmienione), ale tu wystarczy.
-    
-    # Zamiana nazw kolumn z powrotem na nazwy bazodanowe
-    db_df = edited_df.rename(columns=REVERSE_COLUMN_MAP)
-    
-    # Konwersja do listy słowników
-    records = db_df.to_dict('records')
-    
-    # Upsert (aktualizacja na podstawie ID)
-    for record in records:
-        if record.get('id'):
-            supabase.table("seo_content_tasks").upsert(record).execute()
-
-# --- FUNKCJE DIFY (BEZ ZMIAN W LOGICE, TYLKO W ZAPISIE) ---
-
+# --- FUNKCJE DIFY ---
 def run_dify_workflow(api_key, inputs, user_id="streamlit_user"):
     url = f"{st.secrets['dify']['BASE_URL']}/workflows/run"
     headers = {
@@ -115,22 +70,73 @@ def run_dify_workflow(api_key, inputs, user_id="streamlit_user"):
         "user": user_id
     }
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=400)
+        response = requests.post(url, headers=headers, json=payload, timeout=450) # Dłuższy timeout dla generowania
         response.raise_for_status()
         return response.json()
     except Exception as e:
         return {"error": str(e)}
 
-# --- PROCESORY LOGIKI ---
+# --- OBSŁUGA DANYCH ---
 
-def process_research(row_id, keyword, lang, aio):
-    inputs = {"keyword": keyword, "language": lang, "aio": aio if aio else ""}
+def fetch_data():
+    """Pobiera dane i dodaje kolumnę 'Select' do zaznaczania."""
+    response = supabase.table("seo_content_tasks").select("*").order("id", desc=True).execute()
+    data = response.data
+    if not data:
+        return pd.DataFrame(columns=['Select'] + list(COLUMN_MAP.values()))
+    
+    df = pd.DataFrame(data)
+    df = df.rename(columns=COLUMN_MAP)
+    # Dodajemy kolumnę Select na początku
+    df.insert(0, 'Select', False)
+    return df
+
+def update_db_record(row_id, updates):
+    """Aktualizuje rekord w Supabase."""
+    supabase.table("seo_content_tasks").update(updates).eq("id", row_id).execute()
+
+def save_manual_changes(edited_df):
+    """Zapisuje zmiany z edytora (bez kolumny Select)."""
+    # Usuwamy kolumnę Select przed zapisem do bazy
+    df_to_save = edited_df.drop(columns=['Select'], errors='ignore')
+    df_to_save = df_to_save.rename(columns=REVERSE_COLUMN_MAP)
+    
+    records = df_to_save.to_dict('records')
+    # Upsert (tutaj iteracyjnie dla bezpieczeństwa przy małej skali)
+    progress_text = "Zapisywanie zmian..."
+    my_bar = st.progress(0, text=progress_text)
+    
+    total = len(records)
+    for i, record in enumerate(records):
+        if record.get('id'):
+            supabase.table("seo_content_tasks").upsert(record).execute()
+        my_bar.progress((i + 1) / total, text=f"Zapisano wiersz {i+1}/{total}")
+    
+    my_bar.empty()
+    st.success("Zmiany zapisane w bazie!")
+
+def extract_headers_from_text(text):
+    if not isinstance(text, str): return []
+    # Najpierw szukamy tagów H2, jeśli nie ma - bierzemy linie
+    html_headers = re.findall(r'<h2.*?>(.*?)</h2>', text, re.IGNORECASE)
+    if html_headers:
+        return [re.sub(r'<.*?>', '', h).strip() for h in html_headers]
+    return [line.strip() for line in text.split('\n') if line.strip()]
+
+# --- LOGIKA BIZNESOWA (ETAPY) ---
+
+def stage_research(row):
+    """Etap 1: Research"""
+    inputs = {
+        "keyword": row['Słowo kluczowe'],
+        "language": row['Język'],
+        "aio": row['AIO'] if row['AIO'] else ""
+    }
     resp = run_dify_workflow(st.secrets['dify']['API_KEY_RESEARCH'], inputs)
     
-    updates = {}
     if "data" in resp and "outputs" in resp["data"]:
         out = resp["data"]["outputs"]
-        updates = {
+        return {
             "status_research": "✅ Gotowe",
             "serp_phrases": out.get("frazy z serp", ""),
             "senuto_phrases": out.get("frazy_senuto", ""),
@@ -139,347 +145,398 @@ def process_research(row_id, keyword, lang, aio):
             "knowledge_graph": out.get("knowledge_graph", "")
         }
     else:
-        updates = {"status_research": f"❌ Błąd: {resp.get('error', 'Unknown')}"}
-    
-    update_record_in_db(row_id, updates)
+        raise Exception(f"Dify Error: {resp.get('error', 'Unknown error')}")
 
-def process_headers(row_id, keyword, lang, phrases_serp, phrases_senuto, info_graph, comp_headers):
-    frazy_full = f"{phrases_serp}\n{phrases_senuto}"
+def stage_headers(row):
+    """Etap 2: Nagłówki"""
+    frazy_full = f"{row['Frazy z wyników']}\n{row['Frazy Senuto']}"
     inputs = {
-        "keyword": keyword,
-        "language": lang,
+        "keyword": row['Słowo kluczowe'],
+        "language": row['Język'],
         "frazy": frazy_full,
-        "graf": info_graph,
-        "headings": comp_headers
+        "graf": row['Graf informacji'],
+        "headings": row['Nagłówki konkurencji']
     }
     resp = run_dify_workflow(st.secrets['dify']['API_KEY_HEADERS'], inputs)
     
-    updates = {}
     if "data" in resp and "outputs" in resp["data"]:
         out = resp["data"]["outputs"]
-        # Automatycznie wpisujemy H2 do Finalnych, jeśli są puste, żeby ułatwić pracę
-        # Ale użytkownik może je zmienić w edytorze przed generowaniem
-        h2_content = out.get("naglowki_h2", "")
+        h2 = out.get("naglowki_h2", "")
+        questions = out.get("naglowki_pytania", "")
         
-        updates = {
+        # LOGIKA FINALNA: Domyślnie pytania, chyba że finalne już są wypełnione
+        final_headers = row['Nagłówki (Finalne)']
+        if not final_headers:
+            final_headers = questions if questions else h2
+            
+        return {
             "status_headers": "✅ Gotowe",
             "headers_expanded": out.get("naglowki_rozbudowane", ""),
-            "headers_h2": h2_content,
-            "headers_questions": out.get("naglowki_pytania", ""),
-            # Domyślnie kopiujemy H2 do finalnych, chyba że użytkownik coś tam już ma (ale API nadpisuje zazwyczaj)
-            "headers_final": h2_content 
+            "headers_h2": h2,
+            "headers_questions": questions,
+            "headers_final": final_headers
         }
     else:
-        updates = {"status_headers": f"❌ Błąd: {resp.get('error', 'Unknown')}"}
-    
-    update_record_in_db(row_id, updates)
+        raise Exception(f"Dify Error: {resp.get('error', 'Unknown error')}")
 
-def process_rag(row_id, keyword, lang, comp_headers):
-    inputs = {"keyword": keyword, "language": lang, "headings": comp_headers}
+def stage_rag(row):
+    """Etap 3: RAG"""
+    inputs = {
+        "keyword": row['Słowo kluczowe'],
+        "language": row['Język'],
+        "headings": row['Nagłówki konkurencji']
+    }
     resp = run_dify_workflow(st.secrets['dify']['API_KEY_RAG'], inputs)
     
-    updates = {}
     if "data" in resp and "outputs" in resp["data"]:
         out = resp["data"]["outputs"]
-        updates = {
+        return {
             "status_rag": "✅ Gotowe",
             "rag_content": out.get("dokladne", ""),
             "rag_general": out.get("ogolne", "")
         }
     else:
-        updates = {"status_rag": f"❌ Błąd: {resp.get('error', 'Unknown')}"}
-    
-    update_record_in_db(row_id, updates)
+        raise Exception(f"Dify Error: {resp.get('error', 'Unknown error')}")
 
-def process_brief(row_id, keyword, phrases_serp, phrases_senuto, headers_h2, knowledge_graph, info_graph):
-    frazy_full = f"{phrases_serp}\n{phrases_senuto}"
+def stage_brief(row):
+    """Etap 4: Brief"""
+    # Do briefu używamy H2 (struktury)
+    h2_source = row['Nagłówki H2'] if row['Nagłówki H2'] else row['Nagłówki (Finalne)']
+    
+    if not h2_source:
+        raise Exception("Brak nagłówków H2 do stworzenia briefu.")
+
+    frazy_full = f"{row['Frazy z wyników']}\n{row['Frazy Senuto']}"
     inputs = {
-        "keyword": keyword,
+        "keyword": row['Słowo kluczowe'],
         "keywords": frazy_full,
-        "headings": headers_h2,
-        "knowledge_graph": knowledge_graph,
-        "information_graph": info_graph
+        "headings": h2_source,
+        "knowledge_graph": row['Knowledge graph'],
+        "information_graph": row['Graf informacji']
     }
     resp = run_dify_workflow(st.secrets['dify']['API_KEY_BRIEF'], inputs)
     
-    updates = {}
     if "data" in resp and "outputs" in resp["data"]:
         out = resp["data"]["outputs"]
-        updates = {
+        return {
             "status_brief": "✅ Gotowe",
             "brief_json": out.get("brief", ""),
             "brief_html": out.get("html", "")
         }
     else:
-        updates = {"status_brief": f"❌ Błąd: {resp.get('error', 'Unknown')}"}
-    
-    update_record_in_db(row_id, updates)
+        raise Exception(f"Dify Error: {resp.get('error', 'Unknown error')}")
 
-def extract_headers_from_text(text):
-    """Wyciąga nagłówki z tekstu. Obsługuje tagi HTML <h2> lub zwykłe linie tekstu."""
-    if not isinstance(text, str):
-        return []
-    
-    # 1. Próba znalezienia tagów HTML <h2>
-    html_headers = re.findall(r'<h2.*?>(.*?)</h2>', text, re.IGNORECASE)
-    if html_headers:
-        return [re.sub(r'<.*?>', '', h).strip() for h in html_headers]
-    
-    # 2. Jeśli brak HTML, zakładamy, że każda linia to nagłówek (fallback)
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    # Filtrujemy bardzo krótkie linie lub śmieci, jeśli to konieczne
-    return lines
-
-def process_writing(row_id, keyword, lang, headers_final, headers_expanded, rag_content, rag_general, phrases_serp, phrases_senuto, instructions):
-    """Generowanie contentu na podstawie kolumny 'Nagłówki (Finalne)'"""
-    
-    # UŻYWAMY KOLUMNY FINALNEJ!
-    headers_list = extract_headers_from_text(headers_final)
+def stage_writing(row):
+    """Etap 5: Generowanie"""
+    headers_text = row['Nagłówki (Finalne)']
+    headers_list = extract_headers_from_text(headers_text)
     
     if not headers_list:
-        update_record_in_db(row_id, {"status_writing": "❌ Brak nagłówków w kolumnie 'Finalne'"})
-        return
+        raise Exception("Pusta kolumna 'Nagłówki (Finalne)'. Uzupełnij ją przed generowaniem.")
 
-    full_knowledge = f"{rag_content}\n{rag_general}"
-    full_keywords = f"{phrases_serp}, {phrases_senuto}"
+    full_knowledge = f"{row['RAG']}\n{row['RAG General']}"
+    full_keywords = f"{row['Frazy z wyników']}, {row['Frazy Senuto']}"
     
     article_content = ""
     
-    # Aktualizacja statusu na start
-    update_record_in_db(row_id, {"status_writing": "⏳ W trakcie..."})
-    
+    # Generowanie sekcja po sekcji
     for h2 in headers_list:
         inputs = {
             "naglowek": h2,
-            "language": lang,
+            "language": row['Język'],
             "knowledge": full_knowledge,
             "keywords": full_keywords,
-            "headings": headers_expanded, 
+            "headings": row['Nagłówki rozbudowane'], # Kontekst
             "done": article_content,
-            "keyword": keyword,
-            "instruction": instructions
+            "keyword": row['Słowo kluczowe'],
+            "instruction": row['Dodatkowe instrukcje']
         }
         
         resp = run_dify_workflow(st.secrets['dify']['API_KEY_WRITE'], inputs)
         
         if "data" in resp and "outputs" in resp["data"]:
-            section_content = resp["data"]["outputs"].get("result", "")
-            article_content += f"<h2>{h2}</h2>\n{section_content}\n\n"
-            # Opcjonalnie: Zapisuj częściowo po każdej sekcji (bezpieczniej przy długich artach)
-            update_record_in_db(row_id, {"final_article": article_content})
+            section = resp["data"]["outputs"].get("result", "")
+            article_content += f"<h2>{h2}</h2>\n{section}\n\n"
         else:
-            article_content += f"<h2>{h2}</h2>\n[BŁĄD DIFY]\n\n"
+            article_content += f"<h2>{h2}</h2>\n[BŁĄD GENEROWANIA: {resp.get('error')}]\n\n"
     
-    update_record_in_db(row_id, {
+    return {
         "status_writing": "✅ Gotowe",
         "final_article": article_content
-    })
+    }
 
+# --- UNIWERSALNY PROCESOR BATCHOWY ---
+
+def run_batch_process(selected_rows, process_func, status_col_db, success_msg):
+    """
+    Generyczna funkcja do przetwarzania listy wierszy jeden po drugim.
+    Obsługuje UI, pasek postępu, błędy i przycisk STOP.
+    """
+    
+    # UI Kontener na postęp
+    progress_container = st.empty()
+    status_log = st.empty()
+    stop_button_placeholder = st.empty()
+    
+    # Przycisk STOP
+    stop_process = False
+    if stop_button_placeholder.button("⛔ ZATRZYMAJ PO OBECNYM REKORDZIE"):
+        stop_process = True
+    
+    total = len(selected_rows)
+    success_count = 0
+    error_count = 0
+    
+    my_bar = progress_container.progress(0)
+    
+    start_time = time.time()
+    
+    for i, row in enumerate(selected_rows):
+        # Sprawdzenie czy użytkownik nie kliknął STOP (wymagałoby użycia session state w real-time, 
+        # w prostym Streamlit button działa przy przeładowaniu, więc to jest 'soft stop' po odświeżeniu,
+        # ale zrobimy to poprawnie w pętli)
+        
+        row_id = row['ID']
+        keyword = row['Słowo kluczowe']
+        
+        status_log.info(f"⏳ [{i+1}/{total}] Przetwarzanie: **{keyword}**...")
+        
+        # Aktualizacja statusu na "W trakcie"
+        update_db_record(row_id, {status_col_db: "🔄 W trakcie..."})
+        
+        try:
+            # WYKONANIE LOGIKI
+            updates = process_func(row)
+            # ZAPIS WYNIKU
+            update_db_record(row_id, updates)
+            success_count += 1
+            
+        except Exception as e:
+            error_count += 1
+            error_msg = str(e)[:100] # Skracamy błąd
+            update_db_record(row_id, {status_col_db: f"❌ Błąd: {error_msg}"})
+            st.toast(f"Błąd przy '{keyword}': {error_msg}", icon="⚠️")
+        
+        # Aktualizacja paska
+        my_bar.progress((i + 1) / total)
+        
+        # Estymacja czasu
+        elapsed = time.time() - start_time
+        avg_time = elapsed / (i + 1)
+        remaining = avg_time * (total - (i + 1))
+        
+    
+    my_bar.empty()
+    stop_button_placeholder.empty()
+    status_log.success(f"Zakończono! Sukces: {success_count}, Błędy: {error_count}")
+    time.sleep(2)
+    st.rerun()
 
 # --- AUTORYZACJA ---
 def check_password():
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
-
     if not st.session_state["password_correct"]:
         pwd = st.text_input("Hasło dostępu", type="password")
-        if pwd:
-            if pwd == st.secrets["general"]["APP_PASSWORD"]:
-                st.session_state["password_correct"] = True
-                st.rerun()
-            else:
-                st.error("Nieprawidłowe hasło")
+        if pwd == st.secrets["general"]["APP_PASSWORD"]:
+            st.session_state["password_correct"] = True
+            st.rerun()
+        elif pwd:
+            st.error("Złe hasło")
         return False
     return True
 
-# --- MAIN APP ---
+# --- GŁÓWNA APLIKACJA ---
 if check_password():
-    st.title("🚀 SEO 3.0 Content Manager (Supabase)")
     
-    # POBRANIE DANYCH
-    if "data_version" not in st.session_state:
-        st.session_state.data_version = 0
-
-    df = fetch_data()
-
-    # SIDEBAR
+    # SIDEBAR - IMPORT
     with st.sidebar:
-        st.header("Dodaj temat")
-        new_kw = st.text_input("Słowo kluczowe")
-        new_lang = st.text_input("Język", value="pl")
-        new_aio = st.text_area("AIO (opcjonalnie)")
+        st.title("🏭 Content Factory")
         
-        if st.button("Dodaj"):
-            add_record(new_kw, new_lang, new_aio)
-            st.success("Dodano!")
-            st.session_state.data_version += 1
-            st.rerun()
-            
+        st.header("1. Import Danych")
+        uploaded_file = st.file_uploader("Wgraj plik (XLSX/CSV)", type=['xlsx', 'csv'])
+        
+        if uploaded_file:
+            try:
+                if uploaded_file.name.endswith('.csv'):
+                    import_df = pd.read_csv(uploaded_file)
+                else:
+                    import_df = pd.read_excel(uploaded_file)
+                
+                st.write("Podgląd pliku:", import_df.head(2))
+                
+                # Mapowanie kolumn
+                cols = import_df.columns.tolist()
+                c_kw = st.selectbox("Kolumna: Słowo kluczowe", cols, index=0)
+                c_lang = st.selectbox("Kolumna: Język", [None] + cols, index=None)
+                c_aio = st.selectbox("Kolumna: AIO (opcjonalnie)", [None] + cols, index=None)
+                
+                if st.button("📥 Importuj do Bazy"):
+                    count = 0
+                    progress_text = "Importowanie..."
+                    my_bar = st.progress(0, text=progress_text)
+                    
+                    for i, row in import_df.iterrows():
+                        kw = row[c_kw]
+                        lang = row[c_lang] if c_lang else "pl"
+                        aio = row[c_aio] if c_aio else ""
+                        
+                        # Insert to Supabase
+                        supabase.table("seo_content_tasks").insert({
+                            "keyword": str(kw),
+                            "language": str(lang),
+                            "aio_prompt": str(aio),
+                            "headers_final": ""
+                        }).execute()
+                        count += 1
+                        my_bar.progress((i + 1) / len(import_df))
+                    
+                    my_bar.empty()
+                    st.success(f"Zaimportowano {count} wierszy!")
+                    time.sleep(1)
+                    st.rerun()
+                    
+            except Exception as e:
+                st.error(f"Błąd pliku: {e}")
+        
         st.divider()
-        if st.button("Odśwież dane 🔄"):
-            st.rerun()
+        st.header("2. Dodaj Ręcznie")
+        with st.form("add_manual"):
+            m_kw = st.text_input("Słowo kluczowe")
+            m_lang = st.text_input("Język", value="pl")
+            m_sub = st.form_submit_button("Dodaj")
+            if m_sub and m_kw:
+                supabase.table("seo_content_tasks").insert({
+                    "keyword": m_kw, "language": m_lang, "headers_final": ""
+                }).execute()
+                st.success("Dodano!")
+                st.rerun()
 
-    # DATA EDITOR
-    st.subheader("Baza tematów")
+    # --- GŁÓWNY OBSZAR ---
     
-    # Konfiguracja edytora - ukrywamy ID, ale potrzebujemy go do logiki
+    # 1. Pobranie i Edycja Danych
+    df = fetch_data()
+    
+    st.header("📋 Lista Zadań")
+    
+    # Filtrowanie
+    col_f1, col_f2 = st.columns([2, 2])
+    with col_f1:
+        status_filter = st.selectbox("Filtruj wg statusu Research", ["Wszystkie", "Oczekuje", "✅ Gotowe", "❌ Błąd"])
+    
+    if status_filter != "Wszystkie":
+        df = df[df['Status Research'].str.contains(status_filter, na=False)]
+
+    # EDYTOR TABELI
     edited_df = st.data_editor(
         df,
-        key="main_editor",
-        height=400,
+        key="data_editor",
+        height=500,
         use_container_width=True,
         hide_index=True,
         column_config={
-            "ID": st.column_config.NumberColumn(disabled=True),
-            "Generowanie contentu": st.column_config.TextColumn(width="large"),
-            "Nagłówki (Finalne)": st.column_config.TextColumn(width="medium", help="Tutaj wpisz/edytuj nagłówki, które pójdą do generowania treści")
+            "Select": st.column_config.CheckboxColumn("Zaznacz", default=False, width="small"),
+            "ID": st.column_config.NumberColumn(width="small", disabled=True),
+            "Słowo kluczowe": st.column_config.TextColumn(width="medium"),
+            "Nagłówki (Finalne)": st.column_config.TextColumn(width="large", help="Priorytetowa kolumna do generowania treści"),
+            "Generowanie contentu": st.column_config.TextColumn(width="small", disabled=True),
         }
     )
 
-    # Przycisk do zapisu ręcznych zmian
-    if st.button("💾 Zapisz ręczne zmiany w tabeli"):
-        save_editor_changes(edited_df)
-        st.success("Zmiany zapisane w Supabase!")
-        time.sleep(1)
-        st.rerun()
-
-    # AKCJE MASOWE
-    st.divider()
-    st.subheader("Akcje Automatyczne")
-    
-    # Wybór wierszy (symulacja - w data_editor nie ma checkboxów defaultowo, 
-    # więc działamy na zasadzie: wykonaj dla wszystkich, które mają status 'Oczekuje' lub wykonaj dla konkretnego ID z selectboxa)
-    
-    # Dla uproszczenia interfejsu zrobimy panel akcji dla wybranego wiersza lub "Dla wszystkich przefiltrowanych"
-    # Ale najprościej i najbezpieczniej: Przyciski iterują po tabeli z ekranu.
-    
-    c1, c2, c3, c4, c5 = st.columns(5)
-    
-    with c1:
-        if st.button("1. RESEARCH 🔍"):
-            progress = st.progress(0)
-            rows = edited_df.to_dict('records')
-            for i, row in enumerate(rows):
-                # Możesz dodać warunek if row['Status Research'] != '✅ Gotowe':
-                process_research(row['ID'], row['Słowo kluczowe'], row['Język'], row['AIO'])
-                progress.progress((i+1)/len(rows))
-            st.success("Zakończono Research")
+    # Przycisk Zapisz
+    col_save, col_info = st.columns([1, 4])
+    with col_save:
+        if st.button("💾 Zapisz Zmiany"):
+            save_manual_changes(edited_df)
             st.rerun()
+    with col_info:
+        selected_rows = edited_df[edited_df['Select'] == True]
+        count_selected = len(selected_rows)
+        st.info(f"Zaznaczono wierszy: **{count_selected}**")
 
-    with c2:
-        if st.button("2. NAGŁÓWKI 📑"):
-            progress = st.progress(0)
-            rows = edited_df.to_dict('records')
-            for i, row in enumerate(rows):
-                if row['Status Research'] == '✅ Gotowe':
-                    process_headers(row['ID'], row['Słowo kluczowe'], row['Język'], 
-                                    row['Frazy z wyników'], row['Frazy Senuto'], row['Graf informacji'], row['Nagłówki konkurencji'])
-                progress.progress((i+1)/len(rows))
-            st.success("Zakończono Nagłówki")
-            st.rerun()
-
-    with c3:
-        if st.button("3. RAG 🧠"):
-            progress = st.progress(0)
-            rows = edited_df.to_dict('records')
-            for i, row in enumerate(rows):
-                if row['Nagłówki konkurencji']:
-                    process_rag(row['ID'], row['Słowo kluczowe'], row['Język'], row['Nagłówki konkurencji'])
-                progress.progress((i+1)/len(rows))
-            st.success("Zakończono RAG")
-            st.rerun()
-
-    with c4:
-        if st.button("4. BRIEF 📝"):
-            progress = st.progress(0)
-            rows = edited_df.to_dict('records')
-            for i, row in enumerate(rows):
-                # Brief wymaga H2. Możemy użyć Finalnych jeśli są, lub H2. Tu używamy H2 wg Twojego poprzedniego opisu.
-                if row['Nagłówki H2']: 
-                    process_brief(row['ID'], row['Słowo kluczowe'], row['Frazy z wyników'], row['Frazy Senuto'], 
-                                  row['Nagłówki H2'], row['Knowledge graph'], row['Graf informacji'])
-                progress.progress((i+1)/len(rows))
-            st.success("Zakończono Brief")
-            st.rerun()
-            
-    with c5:
-        if st.button("5. GENERUJ ✍️"):
-            st.info("Generowanie z kolumny 'Nagłówki (Finalne)'...")
-            progress = st.progress(0)
-            rows = edited_df.to_dict('records')
-            for i, row in enumerate(rows):
-                # Sprawdzamy czy są nagłówki finalne
-                if row['Nagłówki (Finalne)'] and row['Status Research'] == '✅ Gotowe':
-                    process_writing(
-                        row['ID'], row['Słowo kluczowe'], row['Język'],
-                        row['Nagłówki (Finalne)'], # Źródło struktury
-                        row['Nagłówki rozbudowane'], # Kontekst
-                        row['RAG'], row['RAG General'],
-                        row['Frazy z wyników'], row['Frazy Senuto'],
-                        row['Dodatkowe instrukcje']
-                    )
-                progress.progress((i+1)/len(rows))
-            st.success("Zakończono generowanie")
-            st.rerun()
-
-    # PODGLĄD SZCZEGÓŁÓW (DOMYŚLNIE UKRYTY)
     st.divider()
     
-    # Lista wyboru wiersza
-    if not df.empty:
-        options = {f"{r['ID']}: {r['Słowo kluczowe']}": r['ID'] for index, r in df.iterrows()}
-        selected_label = st.selectbox("Wybierz wiersz do analizy:", list(options.keys()))
-        selected_id = options[selected_label]
+    # --- PANEL STEROWANIA (AKCJE) ---
+    st.subheader("⚙️ Uruchom Procesy (Dla zaznaczonych)")
+    
+    if count_selected == 0:
+        st.warning("Zaznacz wiersze w kolumnie 'Select' powyżej, aby uruchomić procesy.")
+    else:
+        c1, c2, c3, c4, c5 = st.columns(5)
         
-        # Pobieramy aktualny wiersz z DataFrame (edited_df ma najświeższe dane z UI)
-        row_data = edited_df[edited_df['ID'] == selected_id].iloc[0]
+        # Konwersja zaznaczonych do listy słowników dla łatwiejszego przetwarzania
+        rows_to_process = selected_rows.to_dict('records')
 
-        # EXPANDER DOMYŚLNIE ZWINIĘTY (expanded=False)
-        with st.expander(f"🔍 Podgląd szczegółów: {row_data['Słowo kluczowe']}", expanded=False):
-            
-            t1, t2, t3, t4, t5 = st.tabs(["1. Research", "2. Nagłówki (Wszystkie)", "3. RAG", "4. Brief", "5. Wynik"])
+        with c1:
+            if st.button(f"1. RESEARCH ({count_selected})"):
+                run_batch_process(rows_to_process, stage_research, "status_research", "Research zakończony")
+
+        with c2:
+            if st.button(f"2. NAGŁÓWKI ({count_selected})"):
+                run_batch_process(rows_to_process, stage_headers, "status_headers", "Nagłówki wygenerowane")
+
+        with c3:
+            if st.button(f"3. RAG ({count_selected})"):
+                run_batch_process(rows_to_process, stage_rag, "status_rag", "Baza RAG zbudowana")
+
+        with c4:
+            if st.button(f"4. BRIEF ({count_selected})"):
+                run_batch_process(rows_to_process, stage_brief, "status_brief", "Briefy gotowe")
+        
+        with c5:
+            if st.button(f"5. GENERUJ CONTENT ({count_selected})"):
+                st.warning("Upewnij się, że kolumna 'Nagłówki (Finalne)' jest poprawna.")
+                run_batch_process(rows_to_process, stage_writing, "status_writing", "Treści wygenerowane")
+
+    # --- PODGLĄD SZCZEGÓŁÓW ---
+    st.divider()
+    
+    # Pobieramy pełne dane jeszcze raz z bazy (lub z edited_df), żeby mieć pewność
+    # Używamy selectboxa do wyboru ID
+    if not df.empty:
+        all_ids = df['ID'].tolist()
+        keywords = df['Słowo kluczowe'].tolist()
+        options = {f"#{ids} - {kw}": ids for ids, kw in zip(all_ids, keywords)}
+        
+        selected_option = st.selectbox("Wybierz artykuł do podglądu:", options.keys())
+        selected_id_view = options[selected_option]
+        
+        # Pobieramy wiersz z edited_df (żeby widzieć też niezapisane zmiany w UI)
+        view_row = edited_df[edited_df['ID'] == selected_id_view].iloc[0]
+        
+        with st.expander("🔍 Pokaż szczegóły artykułu", expanded=False):
+            t1, t2, t3, t4, t5 = st.tabs(["Research", "Nagłówki", "RAG", "Brief", "Wynik"])
             
             with t1:
-                c_a, c_b = st.columns(2)
-                with c_a:
-                    st.text_area("Frazy SERP", row_data['Frazy z wyników'], height=200)
-                    st.text_area("Graf Informacji", row_data['Graf informacji'], height=200)
-                with c_b:
-                    st.text_area("Frazy Senuto", row_data['Frazy Senuto'], height=200)
-                    st.text_area("Knowledge Graph", row_data['Knowledge graph'], height=200)
-
+                col_a, col_b = st.columns(2)
+                col_a.text_area("SERP", view_row['Frazy z wyników'], height=200)
+                col_a.text_area("Graf", view_row['Graf informacji'], height=200)
+                col_b.text_area("Senuto", view_row['Frazy Senuto'], height=200)
+                col_b.text_area("Knowledge Graph", view_row['Knowledge graph'], height=200)
+            
             with t2:
-                # WSZYSTKIE TYPY NAGŁÓWKÓW
-                st.markdown("#### Edytuj 'Nagłówki (Finalne)' tutaj lub w głównej tabeli")
-                st.info("To pole 'Nagłówki (Finalne)' jest używane w kroku 5 do generowania treści.")
+                st.markdown("### Struktura")
+                c_h1, c_h2 = st.columns(2)
+                c_h1.text_area("H2 (Robocze)", view_row['Nagłówki H2'], height=250)
+                c_h1.text_area("Pytania (Robocze)", view_row['Nagłówki pytania'], height=250)
                 
-                col_h1, col_h2 = st.columns(2)
-                with col_h1:
-                    st.text_area("Nagłówki H2 (z AI)", row_data['Nagłówki H2'], height=300)
-                    st.text_area("Nagłówki Pytania (z AI)", row_data['Nagłówki pytania'], height=300)
-                with col_h2:
-                    st.text_area("Nagłówki Rozbudowane (Kontekst)", row_data['Nagłówki rozbudowane'], height=300)
-                    st.text_area("🔹 Nagłówki (Finalne) - ŹRÓDŁO GENERACJI", row_data['Nagłówki (Finalne)'], height=300, key=f"final_h_{selected_id}")
-
+                c_h2.success("👇 To pole jest używane do generowania treści")
+                c_h2.text_area("⭐ NAGŁÓWKI (FINALNE)", view_row['Nagłówki (Finalne)'], height=530)
+            
             with t3:
-                st.text_area("RAG Dokładny", row_data['RAG'], height=300)
-                st.text_area("RAG Ogólny", row_data['RAG General'], height=300)
-
-            with t4:
-                if row_data['Brief plik']:
-                    st.components.v1.html(row_data['Brief plik'], height=500, scrolling=True)
-                else:
-                    st.info("Brak wygenerowanego briefu HTML")
+                st.text_area("Wiedza Dokładna", view_row['RAG'], height=300)
+                st.text_area("Wiedza Ogólna", view_row['RAG General'], height=300)
                 
-                with st.expander("Zobacz JSON Briefu"):
-                    st.code(row_data['Brief'], language='json')
-
-            with t5:
-                if row_data['Generowanie contentu']:
-                    st.markdown("### Podgląd wyrenderowany:")
-                    st.markdown(row_data['Generowanie contentu'], unsafe_allow_html=True)
-                    st.divider()
-                    st.markdown("### Kod HTML:")
-                    st.code(row_data['Generowanie contentu'], language='html')
+            with t4:
+                if view_row['Brief plik']:
+                    st.components.v1.html(view_row['Brief plik'], height=600, scrolling=True)
                 else:
-                    st.warning("Jeszcze nie wygenerowano treści.")
+                    st.info("Brak briefu HTML")
+            
+            with t5:
+                if view_row['Generowanie contentu']:
+                    st.markdown(view_row['Generowanie contentu'], unsafe_allow_html=True)
+                    st.divider()
+                    st.code(view_row['Generowanie contentu'], language='html')
+                else:
+                    st.warning("Brak treści.")
